@@ -42,12 +42,24 @@ endif
 proto_sources := $(filter %.proto,$(LOCAL_SRC_FILES))
 ifneq ($(proto_sources),)
 ifeq ($(LOCAL_PROTOC_OPTIMIZE_TYPE),micro)
-    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-2.3.0-micro
+    ifneq ($(filter libprotobuf-java-2.3.0-micro,$(LOCAL_STATIC_JAVA_LIBRARIES)),)
+        $(warning Stripping unneeded dependency on libprotobuf-java-2.3.0-micro in $(LOCAL_MODULE))
+        LOCAL_STATIC_JAVA_LIBRARIES := $(filter-out libprotobuf-java-2.3.0-micro,$(LOCAL_STATIC_JAVA_LIBRARIES))
+    endif
+    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-micro
 else
   ifeq ($(LOCAL_PROTOC_OPTIMIZE_TYPE),nano)
-    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-2.3.0-nano
+    ifneq ($(filter libprotobuf-java-2.3.0-nano,$(LOCAL_STATIC_JAVA_LIBRARIES)),)
+        $(warning Stripping unneeded dependency on libprotobuf-java-2.3.0-nano in $(LOCAL_MODULE))
+        LOCAL_STATIC_JAVA_LIBRARIES := $(filter-out libprotobuf-java-2.3.0-nano,$(LOCAL_STATIC_JAVA_LIBRARIES))
+    endif
+    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-nano
   else
-    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-2.3.0-lite
+    ifneq ($(filter libprotobuf-java-2.3.0-lite,$(LOCAL_STATIC_JAVA_LIBRARIES)),)
+        $(warning Stripping unneeded dependency on libprotobuf-java-2.3.0-lite in $(LOCAL_MODULE))
+        LOCAL_STATIC_JAVA_LIBRARIES := $(filter-out libprotobuf-java-2.3.0-lite,$(LOCAL_STATIC_JAVA_LIBRARIES))
+    endif
+    LOCAL_STATIC_JAVA_LIBRARIES += libprotobuf-java-lite
   endif
 endif
 endif
@@ -337,9 +349,16 @@ $(full_classes_compiled_jar): PRIVATE_JAR_PACKAGES := $(LOCAL_JAR_PACKAGES)
 $(full_classes_compiled_jar): PRIVATE_JAR_EXCLUDE_PACKAGES := $(LOCAL_JAR_EXCLUDE_PACKAGES)
 $(full_classes_compiled_jar): PRIVATE_RMTYPEDEFS := $(LOCAL_RMTYPEDEFS)
 $(full_classes_compiled_jar): PRIVATE_DONT_DELETE_JAR_META_INF := $(LOCAL_DONT_DELETE_JAR_META_INF)
-$(full_classes_compiled_jar): $(java_sources) $(java_resource_sources) $(full_java_lib_deps) \
-        $(jar_manifest_file) $(layers_file) $(RenderScript_file_stamp) \
-        $(proto_java_sources_file_stamp) $(LOCAL_ADDITIONAL_DEPENDENCIES)
+$(full_classes_compiled_jar): \
+        $(java_sources) \
+        $(java_resource_sources) \
+        $(full_java_lib_deps) \
+        $(jar_manifest_file) \
+        $(layers_file) \
+        $(RenderScript_file_stamp) \
+        $(proto_java_sources_file_stamp) \
+        $(LOCAL_MODULE_MAKEFILE) \
+        $(LOCAL_ADDITIONAL_DEPENDENCIES)
 	$(transform-java-to-classes.jar)
 
 $(full_classes_compiled_jar): PRIVATE_JAVAC_DEBUG_FLAGS := -g
