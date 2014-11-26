@@ -967,10 +967,184 @@ function is64bit()
     fi
 }
 
+function adb_get_product_device() {
+  local candidate=`adb shell getprop ro.product.device | sed s/.$//`
+  if [ -z $candidate ]; then
+    candidate=`adb shell getprop ro.hardware | sed s/.$//`
+  fi
+  echo $candidate
+}
+
+# returns 0 when process is not traced
+function adb_get_traced_by() {
+  echo `adb shell cat /proc/$1/status | grep -e "^TracerPid:" | sed "s/^TracerPid:\t//" | sed s/.$//`
+}
+
+function gdbclient() {
+  # TODO:
+  # 1. Check for ANDROID_SERIAL/multiple devices
+  local PROCESS_NAME="n/a"
+  local PID=$1
+  local PORT=5039
+  if [ -z "$PID" ]; then
+    echo "Usage: gdbclient <pid|processname> [port number]"
+    return -1
+  fi
+  local DEVICE=$(adb_get_product_device)
+
+  if [ -z "$DEVICE" ]; then
+    echo "Error: Unable to get device name. Please check if device is connected and ANDROID_SERIAL is set."
+    return -2
+  fi
+
+  if [ -n "$2" ]; then
+    PORT=$2
+  fi
+
+  local ROOT=$(gettop)
+  if [ -z "$ROOT" ]; then
+    # This is for the situation with downloaded symbols (from the build server)
+    # we check if they are available.
+    ROOT=`realpath .`
+  fi
+
+  local OUT_ROOT="$ROOT/out/target/product/$DEVICE"
+  local SYMBOLS_DIR="$OUT_ROOT/symbols"
+  local IS_TAPAS_USER="$(get_build_var TARGET_BUILD_APPS)"
+  local TAPAS_SYMBOLS_DIR=
+
+  if [ $IS_TAPAS_USER ]; then
+    TAPAS_SYMBOLS_DIR=$(get_symbols_directory)
+  fi
+
+  if [ ! -d $SYMBOLS_DIR ]; then
+    if [ $IS_TAPAS_USER ]; then
+      mkdir -p $SYMBOLS_DIR/system/bin
+    else
+      echo "Error: couldn't find symbols: $SYMBOLS_DIR does not exist or is not a directory."
+      return -3
+    fi
+  fi
+
+  # let's figure out which executable we are about to debug
+
+  # check if user specified a name -> resolve to pid
+  if [[ ! "$PID" =~ ^[0-9]+$ ]] ; then
+    PROCESS_NAME=$PID
+    PID=$(pid --exact $PROCESS_NAME)
+    if [ -z "$PID" ]; then
+      echo "Error: couldn't resolve pid by process name: $PROCESS_NAME"
+      return -4
+    fi
+  fi
+
+  local EXE=`adb shell readlink /proc/$PID/exe | sed s/.$//`
+  # TODO: print error in case there is no such pid
+  local LOCAL_EXE_PATH=$SYMBOLS_DIR$EXE
+
+  if [ ! -f $LOCAL_EXE_PATH ]; then
+    if [ $IS_TAPAS_USER ]; then
+      adb pull $EXE $LOCAL_EXE_PATH
+    else
+      echo "Error: unable to find symbols for executable $EXE: file $LOCAL_EXE_PATH does not exist"
+      return -5
+    fi
+  fi
+
+  local USE64BIT=""
+
+  if [[ "$(file $LOCAL_EXE_PATH)" =~ 64-bit ]]; then
+    USE64BIT="64"
+  fi
+
+  # and now linker for tapas users...
+  if [ -n "$IS_TAPAS_USER" -a ! -f "$SYMBOLS_DIR/system/bin/linker$USE64BIT" ]; then
+    adb pull /system/bin/linker$USE64BIT $SYMBOLS_DIR/system/bin/linker$USE64BIT
+  fi
+
+  local GDB=
+  local GDB64=
+  local CPU_ABI=`adb shell getprop ro.product.cpu.abilist | sed s/.$//`
+  # TODO: we assume these are available via $PATH
+  if [[ $CPU_ABI =~ (^|,)arm64 ]]; then
+    GDB=arm-linux-androideabi-gdb
+    GDB64=aarch64-linux-android-gdb
+  elif [[ $CPU_ABI =~ (^|,)arm ]]; then
+    GDB=arm-linux-androideabi-gdb
+  elif [[ $CPU_ABI =~ (^|,)x86_64 ]]; then
+    GDB=x86_64-linux-androideabi-gdb
+  elif [[ $CPU_ABI =~ (^|,)x86 ]]; then
+    GDB=x86_64-linux-androideabi-gdb
+  elif [[ $CPU_ABI =~ (^|,)mips64 ]]; then
+    GDB=mipsel-linux-android-gdb
+    GDB64=mips64el-linux-android-gdb
+  elif [[ $CPU_ABI =~ (^|,)mips ]]; then
+    GDB=mipsel-linux-android-gdb
+  else
+    echo "Error: unrecognized cpu.abilist: $CPU_ABI"
+    return -6
+  fi
+
+  # TODO: check if tracing process is gdbserver and not some random strace...
+  if [ "$(adb_get_traced_by $PID)" -eq 0 ]; then
+    # start gdbserver
+    echo "Starting gdbserver..."
+    # TODO: check if adb is already listening $PORT
+    # to avoid unnecessary calls
+    echo ". adb forward for port=$PORT..."
+    adb forward tcp:$PORT tcp:$PORT
+    echo ". starting gdbserver to attach to pid=$PID..."
+    adb shell gdbserver$USE64BIT :$PORT --attach $PID &
+    echo ". give it couple of seconds to start..."
+    sleep 2
+    echo ". done"
+  else
+    echo "It looks like gdbserver is already attached to $PID (process is traced), trying to connect to it using local port=$PORT"
+    adb forward tcp:$PORT tcp:$PORT
+  fi
+
+  local OUT_SO_SYMBOLS=$SYMBOLS_DIR/system/lib$USE64BIT
+  local TAPAS_OUT_SO_SYMBOLS=$TAPAS_SYMBOLS_DIR/system/lib$USE64BIT
+  local OUT_VENDOR_SO_SYMBOLS=$SYMBOLS_DIR/vendor/lib$USE64BIT
+  local ART_CMD=""
+
+  local SOLIB_SYSROOT=$SYMBOLS_DIR
+  local SOLIB_SEARCHPATH=$OUT_SO_SYMBOLS:$OUT_SO_SYMBOLS/hw:$OUT_SO_SYMBOLS/ssl/engines:$OUT_SO_SYMBOLS/drm:$OUT_SO_SYMBOLS/egl:$OUT_SO_SYMBOLS/soundfx:$OUT_VENDOR_SO_SYMBOLS:$OUT_VENDOR_SO_SYMBOLS/hw:$OUT_VENDOR_SO_SYMBOLS/egl
+
+  if [ $IS_TAPAS_USER ]; then
+    SOLIB_SYSROOT=$TAPAS_SYMBOLS_DIR:$SOLIB_SYSROOT
+    SOLIB_SEARCHPATH=$TAPAS_OUT_SO_SYMBOLS:$SOLIB_SEARCHPATH
+  fi
+
+  echo >|"$OUT_ROOT/gdbclient.cmds" "set solib-absolute-prefix $SOLIB_SYSROOT"
+  echo >>"$OUT_ROOT/gdbclient.cmds" "set solib-search-path $SOLIB_SEARCHPATH"
+  local DALVIK_GDB_SCRIPT=$ROOT/development/scripts/gdb/dalvik.gdb
+  if [ -f $DALVIK_GDB_SCRIPT ]; then
+    echo >>"$OUT_ROOT/gdbclient.cmds" "source $DALVIK_GDB_SCRIPT"
+    ART_CMD="art-on"
+  else
+    echo "Warning: couldn't find $DALVIK_GDB_SCRIPT - ART debugging options will not be available"
+  fi
+  echo >>"$OUT_ROOT/gdbclient.cmds" "target remote :$PORT"
+  if [[ $EXE =~ (^|/)(app_process|dalvikvm)(|32|64)$ ]]; then
+    echo >> "$OUT_ROOT/gdbclient.cmds" $ART_CMD
+  fi
+
+  echo >>"$OUT_ROOT/gdbclient.cmds" ""
+
+  local WHICH_GDB=$GDB
+
+  if [ -n "$USE64BIT" -a -n "$GDB64" ]; then
+    WHICH_GDB=$GDB64
+  fi
+
+  gdbwrapper $WHICH_GDB "$OUT_ROOT/gdbclient.cmds" "$LOCAL_EXE_PATH"
+}
+
 # gdbclient now determines whether the user wants to debug a 32-bit or 64-bit
 # executable, set up the approriate gdbserver, then invokes the proper host
 # gdb.
-function gdbclient()
+function gdbclient_old()
 {
    local OUT_ROOT=$(get_abs_build_var PRODUCT_OUT)
    local OUT_SYMBOLS=$(get_abs_build_var TARGET_OUT_UNSTRIPPED)
@@ -1104,7 +1278,7 @@ function jgrep()
 
 function cgrep()
 {
-    find . -name .repo -prune -o -name .git -prune -o -name out -prune -o -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' \) -print0 | xargs -0 grep --color -n "$@"
+    find . -name .repo -prune -o -name .git -prune -o -name out -prune -o -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) -print0 | xargs -0 grep --color -n "$@"
 }
 
 function resgrep()
@@ -1402,7 +1576,7 @@ function godir () {
     \cd $T/$pathname
 }
 
-# Force JAVA_HOME to point to java 1.7 or java 1.6  if it isn't already set.
+# Force JAVA_HOME to point to java 1.7 if it isn't already set.
 #
 # Note that the MacOS path for java 1.7 includes a minor revision number (sigh).
 # For some reason, installing the JDK doesn't make it show up in the
@@ -1419,25 +1593,14 @@ function set_java_home() {
     fi
 
     if [ ! "$JAVA_HOME" ]; then
-      if [ -n "$LEGACY_USE_JAVA6" ]; then
-        case `uname -s` in
-            Darwin)
-                export JAVA_HOME=/System/Library/Frameworks/JavaVM.framework/Versions/1.6/Home
-                ;;
-            *)
-                export JAVA_HOME=/usr/lib/jvm/java-6-sun
-                ;;
-        esac
-      else
-        case `uname -s` in
-            Darwin)
-                export JAVA_HOME=$(/usr/libexec/java_home -v 1.7)
-                ;;
-            *)
-                export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
-                ;;
-        esac
-      fi
+      case `uname -s` in
+          Darwin)
+              export JAVA_HOME=$(/usr/libexec/java_home -v 1.7)
+              ;;
+          *)
+              export JAVA_HOME=/usr/lib/jvm/java-7-openjdk-amd64
+              ;;
+      esac
 
       # Keep track of the fact that we set JAVA_HOME ourselves, so that
       # we can change it on the next envsetup.sh, if required.
@@ -1475,9 +1638,17 @@ function make()
     local secs=$(($tdiff % 60))
     echo
     if [ $ret -eq 0 ] ; then
-        echo -n -e "#### make completed successfully "
+        if [ $(uname) != "Darwin" ]; then
+            echo -n -e "\e[0;32m#### make completed successfully "
+        else
+            echo -n -e "#### make completed successfully "
+        fi
     else
-        echo -n -e "#### make failed to build some targets "
+        if [ $(uname) != "Darwin" ]; then
+            echo -n -e "\e[0;31m#### make failed to build some targets "
+        else
+            echo -n -e "#### make failed to build some targets "
+        fi
     fi
     if [ $hours -gt 0 ] ; then
         printf "(%02g:%02g:%02g (hh:mm:ss))" $hours $mins $secs
@@ -1486,12 +1657,12 @@ function make()
     elif [ $secs -gt 0 ] ; then
         printf "(%s seconds)" $secs
     fi
-    echo -e " ####"
+    if [ $(uname) != "Darwin" ]; then
+        echo -e " ####\e[00m"
+    fi
     echo
     return $ret
 }
-
-
 
 if [ "x$SHELL" != "x/bin/bash" ]; then
     case `ps -o command -p $$` in
